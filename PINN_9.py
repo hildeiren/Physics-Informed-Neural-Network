@@ -4,9 +4,9 @@ import numpy as np
 from pyDOE import lhs  # Latin Hypercube Sampling
 import torch.nn as nn
 import time
-import matplotlib.pyplot as plt
-import scipy.special as sc
 import scipy.io
+import argparse
+
 
 
 def training_points(n_bd, n_int):
@@ -35,11 +35,7 @@ def training_points(n_bd, n_int):
 class SequentialModel(nn.Module):
 
     def __init__(self, layers):
-        self.a = 1.0
-        self.b = 1.0
-        self.eps = 1.0
-        self.gamma = 2 * self.b/self.eps
-        self.q = -1.0
+        self.q = 100.0
         super().__init__()  # call __init__ from parent class
 
         'activation function'
@@ -52,19 +48,6 @@ class SequentialModel(nn.Module):
         self.linears = nn.ModuleList([nn.Linear(layers[i], layers[i + 1]) for i in range(len(layers) - 1)])
 
         self.iter = 0
-
-        '''
-        Alternatively:
-
-        *all layers are callable
-
-        Simple linear Layers
-        self.fc1 = nn.Linear(2,50)
-        self.fc2 = nn.Linear(50,50)
-        self.fc3 = nn.Linear(50,50)
-        self.fc4 = nn.Linear(50,1)
-
-        '''
 
         'Xavier Normal Initialization'
         # std = gain * sqrt(2/(input_dim+output_dim))
@@ -85,16 +68,6 @@ class SequentialModel(nn.Module):
         # convert to float
         a = x.float()
 
-        '''    
-        Alternatively:
-
-        a = self.activation(self.fc1(a))
-        a = self.activation(self.fc2(a))
-        a = self.activation(self.fc3(a))
-        a = self.fc4(a)
-
-        '''
-
         for i in range(len(layers) - 2):
             z = self.linears[i](a)
 
@@ -104,14 +77,24 @@ class SequentialModel(nn.Module):
 
         return a
 
+    def eps1(self, x):
+        return 1 + torch.sin(x**2)
+
+    def eps2(self, x):
+        return 1 + x**3
+
+    def c1(self, x):
+        return torch.cos(2*x)
+
+    def c2(self, x):
+        return 2 + torch.arctan(torch.sin(x)) + torch.exp(torch.sin(x)) + torch.sin(2*x)
+
     def loss_BC_diagonal(self, points):
         KvuKvv = self.forward(points)
         Kvu = KvuKvv[:, 0]
-
         x = points[:, 0]
 
-
-        bc_diag_func = (-0.5 * self.b) * np.exp(-self.gamma * x)
+        bc_diag_func = -(self.c2(x) / (self.eps1(x) + self.eps2(x)))
         loss = self.loss_function(Kvu, bc_diag_func)
         return loss
 
@@ -120,10 +103,30 @@ class SequentialModel(nn.Module):
         Kvu = KvuKvv[:, 0]
         Kvv = KvuKvv[:, 1]
 
-        bottom = self.q * Kvu
+        zero = torch.zeros(n_bd)
+
+        bottom = (self.q * self.eps1(zero) / self.eps2(zero)) * Kvu
 
         loss = self.loss_function(Kvv, bottom)
         return loss
+
+    def eps1_grad(self, points):
+        p = points.clone()
+        p.requires_grad_(True)
+
+        eps1xi = self.eps1(p)
+        eps1_xi = autograd.grad(outputs=eps1xi, inputs=p, grad_outputs=torch.ones_like(eps1xi), create_graph=True)[0]
+
+        return eps1_xi
+
+    def eps2_grad(self, points):
+        p = points.clone()
+        p.requires_grad_(True)
+
+        eps2xi = self.eps2(p)
+        eps2_xi = autograd.grad(outputs=eps2xi, inputs=p, grad_outputs=torch.ones_like(eps2xi), create_graph=True)[0]
+
+        return eps2_xi
 
     def loss_Kvu(self, points):
         p = points.clone()
@@ -136,14 +139,15 @@ class SequentialModel(nn.Module):
         Kvu_grad = \
             autograd.grad(outputs=Kvu, inputs=p, grad_outputs=torch.ones_like(Kvu), create_graph=True)[0]
 
-        self.Kvu_x = Kvu_grad[:, [0]]
-        self.Kvu_xi = Kvu_grad[:, [1]]
+        Kvu_x = Kvu_grad[:, [0]]
+        Kvu_xi = Kvu_grad[:, [1]]
 
-        # PDE equation
-
+        x = points[:, [0]]
         xi = points[:, [1]]
 
-        f1 = self.Kvu_x - self.Kvu_xi - self.b * np.exp(-self.gamma * xi) * Kvv
+        eps1_xi = self.eps1_grad(xi)
+
+        f1 = self.eps2(x) * Kvu_x - self.eps1(xi) * Kvu_xi - eps1_xi * Kvu - self.c2(xi) * Kvv
 
         loss_f1 = self.loss_function(f1, f1_hat)
 
@@ -160,14 +164,15 @@ class SequentialModel(nn.Module):
         Kvv_grad = \
             autograd.grad(outputs=Kvv, inputs=p, grad_outputs=torch.ones_like(Kvv), create_graph=True)[0]
 
-        self.Kvv_x = Kvv_grad[:, [0]]
-        self.Kvv_xi = Kvv_grad[:, [1]]
+        Kvv_x = Kvv_grad[:, [0]]
+        Kvv_xi = Kvv_grad[:, [1]]
 
-        # PDE equation
-
+        x = points[:, [0]]
         xi = points[:, [1]]
 
-        f2 = self.Kvv_x + self.Kvv_xi - self.a * np.exp(self.gamma * xi) * Kvu
+        eps2_xi = self.eps2_grad(xi)
+
+        f2 = self.eps2(x) * Kvv_x + self.eps2(xi) * Kvv_xi + eps2_xi * Kvv - self.c1(xi) * Kvu
 
         loss_f2 = self.loss_function(f2, f2_hat)
 
@@ -175,7 +180,7 @@ class SequentialModel(nn.Module):
 
     def loss(self, d_points, b_points, int_points):
 
-        loss_val = self.loss_BC_diagonal(d_points) + self.loss_BC_bottom(b_points) + \
+        loss_val = 100*self.loss_BC_diagonal(d_points) + self.loss_BC_bottom(b_points) + \
                    self.loss_Kvu(int_points) + self.loss_Kvv(int_points)
 
         return loss_val
@@ -187,7 +192,7 @@ class SequentialModel(nn.Module):
 
         loss = self.loss(diagonal_points, bottom_points, interior_points)
 
-        loss.backward()
+        loss.backward(retain_graph=True)
 
         self.iter += 1
 
@@ -258,6 +263,17 @@ class SequentialModel(nn.Module):
 
 
 if __name__ == '__main__':
+    ################
+    # Arguments
+    ################
+
+    parser = argparse.ArgumentParser(description='PINN for solving the infinite-dimensional backstepping kernel')
+
+    parser.add_argument('--n_bd', type=int, default=100, help='Number of training points at the boundary conditions ')
+    parser.add_argument('--n_int', type=int, default=1000, help='Number of training points at the interior ')
+    parser.add_argument('--hidden_layers', nargs='+', type=int, default=[200, 200], help='Number of units')
+
+    args = parser.parse_args()
     # Set default dtype to float32
     torch.set_default_dtype(torch.float)
 
@@ -276,44 +292,31 @@ if __name__ == '__main__':
         print(torch.cuda.get_device_name())
 
     # Generate points
-    n_bd = 1000  # Total number of collocation points at boundary.
-    n_int = 10000  # Total number of collocation points in the interior.
+    n_bd = args.n_bd  # Total number of collocation points at boundary.
+    n_int = args.n_int  # Total number of collocation points in the interior.
     diagonal_points_np_array, bottom_points_np_array, interior_points_np_array = training_points(n_bd, n_int)
-
-    # X_f_train_np_array, X_u_train_np_array, u_train_np_array = trainingdata(N_u, N_f)
 
     # Convert to tensor and send to GPU
     diagonal_points = torch.from_numpy(diagonal_points_np_array).float().to(device)
     bottom_points = torch.from_numpy(bottom_points_np_array).float().to(device)
     interior_points = torch.from_numpy(interior_points_np_array).float().to(device)
     bc_zeros = torch.zeros(bottom_points.shape[0]).to(device)
-    #test_data = torch.from_numpy(X_u_test).float().to(device)
-    #u = torch.from_numpy(u_true).float().to(device)
+
+
+
     f1_hat = torch.zeros(interior_points.shape[0], 1).to(device)
     f2_hat = torch.zeros(interior_points.shape[0], 1).to(device)
 
-    layers = np.array([2, 40, 40, 40, 40, 40, 40, 40, 40, 2])  # 8 hidden layers
-    #layers = np.array([2, 40, 40, 40, 40, 2]) # 4 hidden layers
+    hidden_layers = np.array(args.hidden_layers)
+    layers = np.concatenate(([2], hidden_layers, [2]))
 
     PINN = SequentialModel(layers)
     PINN.to(device)
-
-    """Saving model"""
-    # Specify a path
-    #PATH = "PINN.state_dict_model.pt"
-
-    # Save
-    #torch.save(PINN.state_dict(), PATH)
-
-    # Load
-    #load_PINN = SequentialModel(layers)
-    #load_PINN.load_state_dict(torch.load(PATH))
 
     # Neural Network Summary
     print(PINN)
 
     params = list(PINN.parameters())
-    #loaded_params = list(load_PINN.parameters())
 
     # Optimization
     # L-BFGS Optimizer
